@@ -1,0 +1,33 @@
+{
+  "name": "inetgeek-mcp",
+  "type": "module",
+  "description": "Read-only MCP server exposing inetGeek's sourced infrastructure data \u2014 provider facts with the verbatim sentence each was read from, comparisons, iScore, and live DNS/SPF checks.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.6.2"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260911.1",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.131.0"
+  },
+  "version": "1.0.0",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nqzai/inetgeek-mcp.git"
+  },
+  "homepage": "https://inetgeek.com/mcp/",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "infrastructure",
+    "cloudflare-workers",
+    "inetgeek"
+  ]
+}

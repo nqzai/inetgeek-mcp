@@ -1,0 +1,31 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "inetgeek-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-03",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // No custom_domain on purpose, for now: this stays reachable only at the
+  // workers.dev URL until it's been used for a while, so shipping it never
+  // requires a DNS change on the inetgeek.com zone. Add a route here once
+  // it's ready to sit at mcp.inetgeek.com.
+  "workers_dev": true,
+
+  "observability": { "enabled": true },
+
+  // Usage counting, so "is this server actually used" stops being a guess.
+  // One data point per MCP call: the method, and for a handshake the client's
+  // self-declared name, or for a tool call the tool's name. No IP address, no
+  // argument values, nothing that identifies a person — see the writer in
+  // src/index.ts for exactly what each column holds and why.
+  //
+  // Query it with the Analytics Engine SQL API (needs an API token carrying
+  // Account Analytics Read, which the deploy token deliberately does not):
+  //
+  //   curl https://api.cloudflare.com/client/v4/accounts/<account>/analytics_engine/sql \
+  //     -H "Authorization: Bearer <token>" \
+  //     -d "SELECT blob1 AS event, blob2 AS who, SUM(_sample_interval) AS n
+  //         FROM inetgeek_mcp WHERE timestamp > NOW() - INTERVAL '30' DAY
+  //         GROUP BY event, who ORDER BY n DESC"
+  "analytics_engine_datasets": [{ "binding": "USAGE", "dataset": "inetgeek_mcp" }]
+}
