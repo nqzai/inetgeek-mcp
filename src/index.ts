@@ -318,6 +318,23 @@ async function fetchPublic(path: string): Promise<{ ok: true; body: string } | {
   return res.ok ? { ok: true, body } : { ok: false, status: res.status, body };
 }
 
+/**
+ * Tool annotations, declared on every tool rather than left to the client.
+ *
+ * ChatGPT's developer-mode guide: "We respect the readOnlyHint tool
+ * annotation. Tools without this hint are treated as write actions." Until
+ * 2026-09-23 no tool here declared it, so every read-only lookup was presented
+ * to ChatGPT as a write — and a client reported seeing eight or nine of the
+ * nineteen tools, a different number each time. Annotations are hints, not
+ * enforcement; they are here so a client can make the right call.
+ *
+ * openWorldHint is true only where a tool reaches outside inetGeek: the three
+ * live DNS tools query third-party public resolvers. Everything else reads
+ * this site's own published feeds.
+ */
+const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } as const;
+const LIVE_LOOKUP = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true } as const;
+
 /** What a tool handler may need from the request that is being served. */
 interface CallContext {
   env: Env;
@@ -331,7 +348,7 @@ function buildServer(ctx: CallContext): McpServer {
     // what a client puts in front of a person, and without it the connector
     // rendered as "inetgeek" rather than the brand.
     title: 'inetGeek',
-    version: '1.6.0',
+    version: '1.6.1',
     websiteUrl: 'https://inetgeek.com',
     description:
       "Sourced infrastructure comparisons: provider pricing, limits and compliance read from each vendor's own documentation and dated, plus iScore, live DNS/SPF checks and a stack planner.",
@@ -387,6 +404,7 @@ function buildServer(ctx: CallContext): McpServer {
     'list_categories',
     {
       title: 'List inetGeek categories',
+      annotations: READ_ONLY,
       description:
         `The infrastructure categories inetGeek tracks — one line per URL section (${SECTIONS_HINT}), each with its current provider count and the category ids that publish under it (hosting groups frontend-serverless, paas, vps-cloud, managed-hosting and mass-market). The section name is the \`category\` argument every other tool takes. Call this first if you don't already know which section a provider falls under. Derived from the published provider list, so it can't lag the site.`,
     },
@@ -411,6 +429,7 @@ function buildServer(ctx: CallContext): McpServer {
     'list_providers',
     {
       title: 'List providers in a category',
+      annotations: READ_ONLY,
       description:
         `Every published provider in one category, with its free tier, entry paid price and inetGeek's editorial "best for" line — the orientation call before get_provider. Every figure is the same sourced, dated fact the provider's own page shows; "Not documented" means undocumented as of the page's verification dates, not a confirmed no. \`category\` is a URL section (${SECTIONS_HINT}) or a category id (e.g. "paas", "vps-cloud", "object-storage"); providers also_in a category are listed there too, marked as such.`,
       inputSchema: {
@@ -446,6 +465,7 @@ function buildServer(ctx: CallContext): McpServer {
     'filter_providers',
     {
       title: 'Filter providers by documented facts',
+      annotations: READ_ONLY,
       description:
         `Providers that document ALL of the given fact keys, each with that fact's value, source URL and verification date — the way to answer "which databases are HIPAA eligible" without reading every fact sheet. A provider documenting a key does not mean the answer is yes: read the value (a compliance fact can read "not ISO 27001 certified"; a support fact can be "Limited" or "Not supported"). Absence means undocumented as of the check, not a confirmed no. Valid keys, grouped as the site groups them — ${CRITERION_KEYS_BY_GROUP}`,
       inputSchema: {
@@ -482,6 +502,7 @@ function buildServer(ctx: CallContext): McpServer {
     'list_startup_credit_providers',
     {
       title: 'List providers with a startup credit program',
+      annotations: READ_ONLY,
       description:
         'Every inetGeek provider documented as offering a startup credit program, with the amount/eligibility as published, a source, and the date it was checked. Use this to filter for an MVP-stage pick before calling get_provider or get_stack_recommendation for the rest of the decision. Absence from this list means undocumented as of the check, not a confirmed "no program".',
     },
@@ -504,6 +525,7 @@ function buildServer(ctx: CallContext): McpServer {
     'search_infrastructure',
     {
       title: 'Search inetGeek',
+      annotations: READ_ONLY,
       description:
         'Full-text search over every page inetGeek has published — providers, comparisons, DNS records, tools and stacks. Provider entries also match on the human label of every fact their page documents ("SOC 2", "point-in-time recovery", "startup credits"), so a fact name finds the providers that carry it — use filter_providers to get the values. Returns matching page paths, titles and descriptions. Use get_provider or compare_providers afterward to fetch the full sourced content for a result.',
       inputSchema: {
@@ -543,6 +565,7 @@ function buildServer(ctx: CallContext): McpServer {
     'get_provider',
     {
       title: 'Get a provider fact sheet',
+      annotations: READ_ONLY,
       description:
         "The full sourced fact sheet for one infrastructure provider — pricing, limits and regions, each with a source URL and the date it was last verified against that source — plus its iScore with interval, rank and per-pillar breakdown (see get_provider_score for the criterion-level basis). Use search_infrastructure first if you don't know the exact category/slug.",
       inputSchema: {
@@ -567,6 +590,7 @@ function buildServer(ctx: CallContext): McpServer {
     'get_provider_score',
     {
       title: "Get a provider's iScore and what moves it",
+      annotations: READ_ONLY,
       description:
         "inetGeek's iScore for one provider: 0–100 against its category peers with an 80% interval and rank, the six pillars (price, capacity, capability, trust, evidence, adoption) each with its interval, weight and coverage, every scored criterion with the fact it was read from and the peer median it was measured against, and — for a provider asking how to score higher — the criteria its peers document that it does not. Computed at build from sourced facts by rules published at /iscore/; not a provider claim, not a benchmark, and not comparable across categories. Always report the interval with the number: a thin record is pulled toward the category middle with a wide band, and that band is the finding. `category` here is a CATEGORY ID (\"database\", \"paas\", \"llm-api\"), not a URL section — list_categories shows both.",
       inputSchema: {
@@ -618,6 +642,7 @@ function buildServer(ctx: CallContext): McpServer {
     'list_alternatives',
     {
       title: 'Alternatives to a provider, ranked by iScore',
+      annotations: READ_ONLY,
       description:
         "Every peer in a provider's category ranked by iScore — the same list as the site's /{section}/{slug}/alternatives/ page — each with its score and interval, free tier, entry price, editorial best-for line, and up to two sourced facts where it differs from the provider named. For an architect choosing a substitute; use get_provider_score on any row for the breakdown, compare_providers where a curated pair exists. Ranks whose intervals overlap are an ordering, not a finding, and are marked. `category` is a CATEGORY ID (\"database\", \"paas\"), not a URL section.",
       inputSchema: {
@@ -676,6 +701,7 @@ function buildServer(ctx: CallContext): McpServer {
     'compare_providers',
     {
       title: 'Compare two providers',
+      annotations: READ_ONLY,
       description:
         "inetGeek's sourced side-by-side comparison of two providers, where one exists — real differences computed from each provider's own published facts, never templated prose. Pair order doesn't matter; both orderings are tried.",
       inputSchema: {
@@ -701,6 +727,7 @@ function buildServer(ctx: CallContext): McpServer {
     'list_comparisons',
     {
       title: 'List published comparisons',
+      annotations: READ_ONLY,
       description:
         "Every side-by-side comparison inetGeek has published, optionally only those involving one provider — so an agent learns which pairs exist before calling compare_providers, instead of discovering a pair is unpublished by trying it. Only pairs that clear the site's sourcing quality gate appear.",
       inputSchema: {
@@ -734,6 +761,7 @@ function buildServer(ctx: CallContext): McpServer {
     'get_stack_recommendation',
     {
       title: 'Get hosting recommendations for a framework',
+      annotations: READ_ONLY,
       description:
         "Every host that publishes real support for a given framework or runtime, ordered by strength of documentation (a dedicated deployment guide first, a generic one second — there is no numeric score). Each row carries the entry paid plan price. This is the tool for 'what should I deploy X on' — cross-check a candidate's free tier and startup-credit-program facts with get_provider before deciding an MVP-stage pick.",
       inputSchema: {
@@ -757,6 +785,7 @@ function buildServer(ctx: CallContext): McpServer {
     'plan_infrastructure',
     {
       title: 'Plan an infrastructure stack',
+      annotations: READ_ONLY,
       description:
         "inetGeek's /plan/ planner: one suggested starting provider per layer — the cheapest with a documented free tier or a clean USD starting price, ranked by the provider's own facts, never a quality score — with its editorial reason and a floor total. THE TOTAL IS A FLOOR, NOT A PROJECTION: it sums documented entry points ($0 for a real free tier), and a layer whose pricing is usage-based with no flat minimum is listed as excluded, never counted as free; traffic, storage and usage move every number upward. Pick a stage or name layers explicitly; each stage is a superset of the one before it, and `scale` is most layers rather than all of them. Security requirements re-pick every layer whose providers document those criteria, and say so when no candidate satisfies every requirement rather than picking one anyway.",
       inputSchema: {
@@ -894,6 +923,7 @@ function buildServer(ctx: CallContext): McpServer {
     'get_changelog',
     {
       title: 'What changed on inetGeek',
+      annotations: READ_ONLY,
       description:
         'Every provider fact that moved — a price or limit that changed (before, after, source, date), a fact newly sourced, or a provider newly published — derived from the git history of the site data, so it cannot disagree with the pages. Value changes are listed first: a price that moved is the news, a fact newly sourced is inventory. Ask "what changed since I last planned" with `since`; narrow to one provider with `provider`. Returns the most recent entries (the feed carries the last 100).',
       inputSchema: {
@@ -929,6 +959,7 @@ function buildServer(ctx: CallContext): McpServer {
     'get_dns_record',
     {
       title: 'DNS record reference',
+      annotations: READ_ONLY,
       description:
         `inetGeek's reference page for one DNS record type or email-authentication mechanism, as text — what it does, how it behaves, and the common mistakes. Reference text, not a live lookup; use check_dns for a domain's actual records. Types: ${DNS_SLUGS.join(', ')}.`,
       inputSchema: { type: z.string().describe('e.g. "cname", "mx-record", "spf", "dmarc", "ttl"') },
@@ -948,6 +979,7 @@ function buildServer(ctx: CallContext): McpServer {
     'check_dns',
     {
       title: 'Live DNS lookup',
+      annotations: LIVE_LOOKUP,
       description:
         "Queries public DNS-over-HTTPS resolvers for a domain's A/AAAA/CNAME/MX/TXT/NS records right now, via inetGeek's own rate-limited lookup endpoint. Nothing queried is stored.",
       inputSchema: { domain: z.string().describe('e.g. "example.com"') },
@@ -962,6 +994,7 @@ function buildServer(ctx: CallContext): McpServer {
     'check_spf',
     {
       title: 'Live SPF check',
+      annotations: LIVE_LOOKUP,
       description:
         "Evaluates a domain's SPF record right now, including the RFC 7208 ten-DNS-lookup limit, via inetGeek's own checker. Nothing queried is stored.",
       inputSchema: { domain: z.string().describe('e.g. "example.com"') },
@@ -976,6 +1009,7 @@ function buildServer(ctx: CallContext): McpServer {
     'check_dns_propagation',
     {
       title: 'Check DNS propagation',
+      annotations: LIVE_LOOKUP,
       description:
         'Queries four independent public DNS resolvers for one record and compares their answers, to check whether a change has propagated. Nothing queried is stored.',
       inputSchema: {
@@ -995,6 +1029,7 @@ function buildServer(ctx: CallContext): McpServer {
     'get_ledger',
     {
       title: 'What inetGeek says it could not find, and what it changed',
+      annotations: READ_ONLY,
       description:
         "inetGeek's public ledger. Three records an agent cannot get anywhere else: every vendor page that was READ on a stated date and found silent on a criterion, every criterion classed as one a product structurally cannot have, and every change to a published figure with whether the vendor moved it or inetGeek corrected its own reading. A silence record is an observation about one page on one date — it is NOT a statement that the provider lacks the thing, and it must not be reported as one. It exists because comparisons lean on it: a documented criterion outranks a page that was read and does not mention it, and that lean is only fair if the evidence behind it is checkable. A provider whose page says more than was found can send the URL to https://inetgeek.com/contact/ and the row is replaced. Filter to one provider with `provider`, or omit it for the whole ledger.",
       inputSchema: {
