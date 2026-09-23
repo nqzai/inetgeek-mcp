@@ -56,7 +56,13 @@ const jsonCache = new Map<string, { at: number; data: unknown }>();
 async function loadJson<T>(path: string): Promise<T> {
   const hit = jsonCache.get(path);
   if (hit && Date.now() - hit.at < 5 * 60_000) return hit.data as T;
-  const res = await fetch(`${SITE}${path}`);
+  // The map above only helps an isolate that has already answered a call.
+  // cacheEverything is what a COLD isolate gets, and a cold isolate is the
+  // common case for an MCP server that is called in bursts and then idle —
+  // the same flag the icon and server-card fetches at the bottom of this file
+  // have always used. Without it a cold start paid a full origin round trip
+  // for /providers/core.json, which is 226 KB on the wire.
+  const res = await fetch(`${SITE}${path}`, { cf: { cacheEverything: true } });
   if (!res.ok) throw new Error(`${path} fetch failed: HTTP ${res.status}`);
   const data = (await res.json()) as T;
   jsonCache.set(path, { at: Date.now(), data });
@@ -64,13 +70,28 @@ async function loadJson<T>(path: string): Promise<T> {
 }
 const loadSearchIndex = () => loadJson<SearchIndex>('/search-index.json');
 
-/** Shape of /providers.json — see src/pages/providers.json.ts in the site repo. */
+/**
+ * Shape of the provider feed — see src/lib/providers-feed.ts in the site repo.
+ *
+ * This reads the `core` view, not `/providers.json`. The full feed carries the
+ * verbatim excerpt behind every figure, which is the right default for an
+ * agent reading the file directly and the wrong one here: it is 2.05 MB
+ * against core's 1.07 MB, and these tools want the values, not the evidence.
+ * A caller who wants an excerpt gets it from get_provider, which fetches the
+ * provider's own page.
+ *
+ * `display` is OPTIONAL in core, present only where it differs from `value` —
+ * for 2,364 of 3,055 facts the two were the same string. Read it through
+ * shown() below, never directly.
+ */
 interface PublishedFact {
   value: unknown;
-  display: string;
+  display?: string;
   source_url: string;
   verified_at: string;
 }
+/** The rendered value: `display` where the feed carries one, else `value`. */
+const shown = (fact: PublishedFact): string => fact.display ?? String(fact.value);
 interface PublishedProvider {
   id: string;
   name: string;
@@ -86,7 +107,7 @@ interface ProvidersFile {
   fact_labels: Record<string, string>;
   providers: PublishedProvider[];
 }
-const loadProviders = () => loadJson<ProvidersFile>('/providers.json');
+const loadProviders = () => loadJson<ProvidersFile>('/providers/core.json');
 
 /** Shape of /plan.json — see src/pages/plan.json.ts and src/lib/plan.ts in the site repo. */
 interface PlanLayerResult {
@@ -281,7 +302,7 @@ const DNS_SLUGS = [
 ];
 
 function factLine(key: string, fact: PublishedFact, labels: Record<string, string>): string {
-  return `  ${labels[key] ?? key}: ${fact.display} [verified ${fact.verified_at}, ${fact.source_url}]`;
+  return `  ${labels[key] ?? key}: ${shown(fact)} [verified ${fact.verified_at}, ${fact.source_url}]`;
 }
 
 function textResult(text: string) {
@@ -289,19 +310,28 @@ function textResult(text: string) {
 }
 
 async function fetchPublic(path: string): Promise<{ ok: true; body: string } | { ok: false; status: number; body: string }> {
-  const res = await fetch(`${SITE}${path}`);
+  // Markdown mirrors, held in no map — they are per-page and there are 1,061
+  // of them, so caching them in the isolate would be a memory leak shaped
+  // like a cache. The edge is the right place for them instead.
+  const res = await fetch(`${SITE}${path}`, { cf: { cacheEverything: true } });
   const body = await res.text();
   return res.ok ? { ok: true, body } : { ok: false, status: res.status, body };
 }
 
-function buildServer(): McpServer {
+/** What a tool handler may need from the request that is being served. */
+interface CallContext {
+  env: Env;
+  request: Request;
+}
+
+function buildServer(ctx: CallContext): McpServer {
   const server = new McpServer({
     name: 'inetgeek',
     // `name` is the wire identifier and stays the lowercase slug; `title` is
     // what a client puts in front of a person, and without it the connector
     // rendered as "inetgeek" rather than the brand.
     title: 'inetGeek',
-    version: '1.5.0',
+    version: '1.6.0',
     websiteUrl: 'https://inetgeek.com',
     description:
       "Sourced infrastructure comparisons: provider pricing, limits and compliance read from each vendor's own documentation and dated, plus iScore, live DNS/SPF checks and a stack planner.",
@@ -398,8 +428,8 @@ function buildServer(): McpServer {
       }
       const lines = matches.map((p) => {
         const alsoIn = sectionOf(p) !== wanted && p.category !== wanted ? ` (also_in — canonical category ${p.category})` : '';
-        const free = p.facts.free_tier ? p.facts.free_tier.display : 'Not documented';
-        const entry = p.facts.minimum_paid_price ? p.facts.minimum_paid_price.display : 'Not documented';
+        const free = p.facts.free_tier ? shown(p.facts.free_tier) : 'Not documented';
+        const entry = p.facts.minimum_paid_price ? shown(p.facts.minimum_paid_price) : 'Not documented';
         return [
           `${p.name}${alsoIn} — ${SITE}${p.path}`,
           `  free tier: ${free}`,
@@ -617,14 +647,20 @@ function buildServer(): McpServer {
           if (p && subj) {
             for (const [k, f] of Object.entries(p.facts)) {
               const mine = subj.facts[k];
-              if (!mine || mine.display === f.display) continue;
-              if (f.display.length <= SHORT && mine.display.length <= SHORT) diffs.push(`${fact_labels[k] ?? k}: ${f.display} vs ${mine.display}`);
+              if (!mine || shown(mine) === shown(f)) continue;
+              const theirs = shown(f);
+              const ours = shown(mine);
+              if (theirs.length <= SHORT && ours.length <= SHORT) diffs.push(`${fact_labels[k] ?? k}: ${theirs} vs ${ours}`);
               if (diffs.length === 2) break;
             }
           }
           return [
             `${r.rank}. ${r.name} — iScore ${fmtScore(r)}${p ? ` — ${SITE}${p.path}` : ''}`,
-            ...(p ? [`   free tier: ${p.facts.free_tier?.display ?? 'Not documented'}; entry price: ${p.facts.minimum_paid_price?.display ?? 'Not documented'}`] : []),
+            ...(p
+              ? [
+                  `   free tier: ${p.facts.free_tier ? shown(p.facts.free_tier) : 'Not documented'}; entry price: ${p.facts.minimum_paid_price ? shown(p.facts.minimum_paid_price) : 'Not documented'}`,
+                ]
+              : []),
             ...(p?.best_for ? [`   best for: ${p.best_for}`] : []),
             ...(diffs.length ? [`   differs from ${subject.name} on: ${diffs.join(' · ')}`] : []),
           ].join('\n');
@@ -1002,6 +1038,122 @@ function buildServer(): McpServer {
     },
   );
 
+  // ------------------------------------------------------------ feedback
+  //
+  // THE ONE TOOL THAT WRITES. Everything above reads inetGeek's published
+  // data; this records a note for the maintainer and nothing else. It cannot
+  // change a figure, a page or a score — a correction is read by a person,
+  // checked against the vendor's own page with scripts/triage-correction.mjs,
+  // and applied by the same import every other fact goes through.
+  //
+  // What is stored is what the agent submits, its User-Agent and the time —
+  // see migrations/0001_feedback.sql. The IP is the rate-limit key and is
+  // never written. Every free-text field is untrusted input to whoever reads
+  // it later, and scripts/mcp-feedback.mjs treats it that way.
+  server.registerTool(
+    'send_feedback',
+    {
+      title: 'Send feedback about the inetGeek MCP server',
+      description:
+        "Tell inetGeek's maintainer something is wrong, missing or confusing in this MCP server's data or tools — a figure that disagrees with the vendor's own page, a tool that errored or returned something unusable, a provider or criterion you needed and could not get, or a tool whose output misled you. Read by a person; nothing is applied automatically, and a data correction is only made after it is checked against the provider's own published page. " +
+        'For wrong_data, include `provider` and `criterion` (the ids the other tools use) and `evidence_url`: the provider\'s OWN page that states the correct value — a third-party page cannot be used. For tool problems, name the `tool` and put the arguments you passed and what came back in `observed`. ' +
+        "Do NOT include personal data, credentials, API keys, your user's code, or anything from your conversation that your user has not agreed to share: this is stored. This is the only tool on this server that writes anything.",
+      inputSchema: {
+        kind: z
+          .enum(['wrong_data', 'missing_data', 'tool_error', 'tool_confusing', 'feature_request', 'other'])
+          .describe(
+            'wrong_data: a figure disagrees with the vendor\'s page. missing_data: a provider, criterion or figure you needed is absent. tool_error: a tool failed. tool_confusing: a tool worked but its output misled you. feature_request: a tool or field that does not exist. other: anything else.',
+          ),
+        message: z
+          .string()
+          .min(10)
+          .max(2000)
+          .describe('What is wrong or missing, in plain language. Specific beats long.'),
+        tool: z.string().max(64).optional().describe('The tool concerned, e.g. "get_provider".'),
+        provider: z
+          .string()
+          .regex(/^[a-z0-9-]{1,64}$/)
+          .optional()
+          .describe('Provider id as the other tools return it, e.g. "neon".'),
+        criterion: z
+          .string()
+          .regex(/^[a-z0-9_]{1,64}$/)
+          .optional()
+          .describe('Fact key as the other tools return it, e.g. "free_tier".'),
+        evidence_url: z
+          .string()
+          .url()
+          .max(500)
+          .optional()
+          .describe("For wrong_data: the provider's own page that states the correct value."),
+        observed: z
+          .string()
+          .max(1000)
+          .optional()
+          .describe('What you passed and what came back, or what the page currently shows.'),
+        expected: z.string().max(1000).optional().describe('What you expected instead.'),
+        client: z
+          .string()
+          .max(64)
+          .optional()
+          .describe('The agent or client product sending this, e.g. "Claude Code". Not a person\'s name.'),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async (args) => {
+      const db = ctx.env.FEEDBACK;
+      if (!db) {
+        return textResult(
+          'Feedback is not being collected on this deployment of the server (no FEEDBACK database is bound). Report it at https://inetgeek.com/contact/ instead.',
+        );
+      }
+      if (ctx.env.FEEDBACK_RATE_LIMIT) {
+        // Keyed on the connecting IP, used only to count; never stored.
+        const key = ctx.request.headers.get('cf-connecting-ip') ?? 'unknown';
+        const { success } = await ctx.env.FEEDBACK_RATE_LIMIT.limit({ key });
+        if (!success) {
+          return {
+            content: [{ type: 'text' as const, text: 'Too many feedback calls from this client in the last minute. Send one combined report, or try again shortly.' }],
+            isError: true,
+          };
+        }
+      }
+      const id = `fb_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
+      const userAgent = (ctx.request.headers.get('user-agent') ?? '').slice(0, 160) || null;
+      await db
+        .prepare(
+          `INSERT INTO feedback (id, received_at, kind, tool, provider, criterion, evidence_url, message, observed, expected, client, user_agent)
+           VALUES (?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .bind(
+          id,
+          args.kind,
+          args.tool ?? null,
+          args.provider ?? null,
+          args.criterion ?? null,
+          args.evidence_url ?? null,
+          args.message,
+          args.observed ?? null,
+          args.expected ?? null,
+          args.client ?? null,
+          userAgent,
+        )
+        .run();
+      const next =
+        args.kind === 'wrong_data'
+          ? args.evidence_url
+            ? " It will be checked against the page you cited; if that page is the provider's own and states a different value, the figure is corrected and the change appears at https://inetgeek.com/ledger/."
+            : " No evidence_url was given, so it can only be checked against inetGeek's existing source. Sending the provider's own page that states the correct value makes it actionable."
+          : '';
+      return textResult(`Recorded as ${id}. A person reads every report; nothing is applied automatically.${next}`);
+    },
+  );
+
   return server;
 }
 
@@ -1012,6 +1164,10 @@ interface Env {
    * than throwing on a line that exists only to count.
    */
   USAGE?: AnalyticsEngineDataset;
+  /** Feedback from send_feedback. Optional so a copy without it still runs. */
+  FEEDBACK?: D1Database;
+  /** Per-IP limit on send_feedback; the key is never stored. */
+  FEEDBACK_RATE_LIMIT?: RateLimit;
 }
 
 /**
@@ -1119,13 +1275,13 @@ export default {
 
     if (url.pathname !== '/mcp') {
       return new Response(
-        'inetGeek MCP server — read-only access to sourced infrastructure comparisons.\n' +
+        'inetGeek MCP server — sourced infrastructure comparisons, read-only apart from send_feedback.\n' +
           'POST MCP requests to /mcp. See https://inetgeek.com for the human-facing site.',
         { status: url.pathname === '/' ? 200 : 404, headers: { 'content-type': 'text/plain; charset=utf-8' } },
       );
     }
 
-    const server = buildServer();
+    const server = buildServer({ env, request });
     const transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       // Plain JSON responses, not an SSE stream — nothing here streams or
@@ -1190,5 +1346,22 @@ export default {
     }
 
     return transport.handleRequest(normalized);
+  },
+
+  /**
+   * Daily retention sweep for send_feedback rows (cron in wrangler.jsonc).
+   *
+   * Closed feedback goes 90 days after it was closed; anything at all goes
+   * after 365 days, handled or not. /privacy/ states both periods, so they are
+   * enforced here rather than left to someone remembering to run a script.
+   * Timestamps are written by SQLite's datetime('now') on insert and on close,
+   * so these comparisons are like-for-like strings.
+   */
+  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+    if (!env.FEEDBACK) return;
+    await env.FEEDBACK.batch([
+      env.FEEDBACK.prepare("DELETE FROM feedback WHERE closed_at IS NOT NULL AND closed_at < datetime('now', '-90 days')"),
+      env.FEEDBACK.prepare("DELETE FROM feedback WHERE received_at < datetime('now', '-365 days')"),
+    ]);
   },
 };

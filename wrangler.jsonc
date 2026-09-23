@@ -27,5 +27,36 @@
   //     -d "SELECT blob1 AS event, blob2 AS who, SUM(_sample_interval) AS n
   //         FROM inetgeek_mcp WHERE timestamp > NOW() - INTERVAL '30' DAY
   //         GROUP BY event, who ORDER BY n DESC"
-  "analytics_engine_datasets": [{ "binding": "USAGE", "dataset": "inetgeek_mcp" }]
+  "analytics_engine_datasets": [{ "binding": "USAGE", "dataset": "inetgeek_mcp" }],
+
+  // Feedback from agents, written by the send_feedback tool and nothing else.
+  // D1 rather than the Analytics Engine dataset above: Analytics Engine
+  // samples at volume, and a feedback row must never be sampled away. Schema
+  // and what is (not) stored: migrations/0001_feedback.sql. Read and triaged
+  // with `npm run feedback` from the site repo (scripts/mcp-feedback.mjs).
+  //
+  // Running your own copy: create your own database with
+  // `wrangler d1 create <name>`, put its id here, and apply the migration with
+  // `wrangler d1 migrations apply <name> --remote`. Without the binding the
+  // tool still registers and answers that feedback is not being collected.
+  "d1_databases": [
+    {
+      "binding": "FEEDBACK",
+      "database_name": "inetgeek-mcp-feedback",
+      "database_id": "037a35ea-ea56-49db-9a9d-291b62b2d3f3",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  // One feedback call per caller every 12 seconds on average. Keyed on the
+  // connecting IP, which is used to increment a counter and never stored — the
+  // same arrangement the site's DNS tools use, described on /privacy/.
+  "ratelimits": [
+    { "name": "FEEDBACK_RATE_LIMIT", "namespace_id": "2001", "simple": { "limit": 5, "period": 60 } }
+  ],
+
+  // Daily retention sweep: closed feedback is deleted 90 days after it was
+  // closed, and anything at all after 365 days. A retention promise on
+  // /privacy/ has to be enforced by something that runs without being asked.
+  "triggers": { "crons": ["17 3 * * *"] }
 }

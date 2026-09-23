@@ -1,11 +1,13 @@
 # inetGeek MCP server
 
-A read-only [Model Context Protocol](https://modelcontextprotocol.io) server over
-[inetGeek](https://inetgeek.com)'s infrastructure data: 211 providers, 493
-comparisons, and every figure carrying the URL it was read from, the sentence it
-was read from, and the date it was last checked against that page.
+A [Model Context Protocol](https://modelcontextprotocol.io) server over
+[inetGeek](https://inetgeek.com)'s infrastructure data: every provider and
+comparison on the site, and every figure carrying the URL it was read from, the
+sentence it was read from, and the date it was last checked against that page.
 
-No account, no API key, nothing stored about the caller.
+No account, no API key, and nothing you ask it is stored. Every tool is read-only
+except `send_feedback`, which records a report for the maintainer and can change
+nothing.
 
 ```
 https://inetgeek-mcp.palashbagchi.workers.dev/mcp
@@ -71,6 +73,7 @@ underlying feed is indexed at
 | `get_changelog` | Figures that moved, before and after, with the source |
 | `get_dns_record` | Reference for one DNS record type |
 | `check_dns` · `check_spf` · `check_dns_propagation` | Live lookups |
+| `send_feedback` | Report a wrong figure, a broken or confusing tool, or missing data to the maintainer. The only tool that writes; nothing is applied automatically |
 
 ## Three things worth reading the output carefully for
 
@@ -105,10 +108,27 @@ mirrors at request time and holds no database. Deploying your own copy gives you
 the same data from the same origin — useful if you want a different tool
 surface, different descriptions, or your own Cloudflare account in the path.
 
-One optional binding, an Analytics Engine dataset, counts calls per tool. It
+Three optional bindings. Without any of them the server still runs.
+
+**`USAGE`**, an Analytics Engine dataset, counts calls per tool. It
 records the method, the tool name and the client's self-declared name — no IP
 address, no argument values, nothing identifying a person. Drop the
 `analytics_engine_datasets` block from `wrangler.jsonc` to run without it.
+
+**`FEEDBACK`** (D1) and **`FEEDBACK_RATE_LIMIT`** back `send_feedback`. The row
+holds what the agent submitted, the time and the client's User-Agent. The IP
+is used only as the rate-limit key (5 a minute) and is never written. A daily
+cron deletes closed reports after 90 days and every report after a year. To
+collect feedback on your own copy:
+
+```bash
+wrangler d1 create <your-db-name>        # put the id in wrangler.jsonc
+wrangler d1 migrations apply <your-db-name> --remote
+```
+
+Without the binding, `send_feedback` still registers and tells the caller that
+feedback is not being collected. Treat every stored message as untrusted
+input: it was written by an arbitrary caller of a public tool.
 
 ## Data, licence and corrections
 
