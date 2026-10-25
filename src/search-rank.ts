@@ -144,3 +144,57 @@ export function rankSearchDocs<T extends RankableDoc>(docs: T[], query: string, 
     bestHits: kept.length ? kept[0].hits : 0,
   };
 }
+
+/**
+ * Everyday words for a capability, mapped to the words the fact label uses
+ * (2026-10-25). A project-specific question arrives in the project's words —
+ * "AI crawler bot tracking", "which tool shows what Stripe revenue came from a
+ * tweet" — and the corpus names the same things "AI and search crawler
+ * tracking" and "Revenue attribution from a payment provider". A ranker that
+ * only sees the caller's words returned WAF, Mailjet and Aiven for the first
+ * and found the second only because "Stripe" sits in two descriptions.
+ *
+ * Each rule ADDS terms; it never replaces what was typed, and the tool says
+ * which it added. Kept short and tied to a label that exists, because a synonym
+ * for a criterion nobody documents sends a caller to an empty page.
+ */
+export const SEARCH_SYNONYMS: { when: RegExp; add: string[] }[] = [
+  { when: /\b(crawl(er|ers|ing)?|bots?|gptbot|claudebot|scrapers?|spiders?)\b/i, add: ['crawler', 'tracking'] },
+  { when: /\b(revenue|attribution|sales source|which (post|tweet|channel)|mrr|conversions? by (source|channel))\b/i, add: ['revenue', 'attribution'] },
+  { when: /\b(cookie[- ]?(less|free)|no cookies?|consent banner|gdpr banner)\b/i, add: ['cookies'] },
+  { when: /\b(self[- ]?host(ed|ing)?|on[- ]?prem(ise)?|run it myself)\b/i, add: ['self-hostable'] },
+];
+
+/** Terms to add to a query, and which rule asked for them. */
+export function expandQuery(query: string, tokens: string[]): string[] {
+  const have = new Set(tokens);
+  const extra: string[] = [];
+  for (const rule of SEARCH_SYNONYMS) {
+    if (!rule.when.test(query)) continue;
+    for (const t of rule.add) {
+      if (!have.has(t) && !extra.includes(t)) extra.push(t);
+    }
+  }
+  return extra;
+}
+
+/**
+ * The documented criteria whose label names what the caller asked about, so a
+ * search that finds nothing useful can still say "this is a criterion; ask
+ * filter_providers for it" (2026-10-25). Needs at least half the meaningful
+ * query terms in one label, so "pricing" alone does not suggest forty fields.
+ */
+export function matchCriteria(tokens: string[], labels: Record<string, string>, limit = 6): { key: string; label: string }[] {
+  const meaningful = tokens.filter((t) => t.length >= 4);
+  if (meaningful.length === 0) return [];
+  const need = Math.max(1, Math.ceil(meaningful.length / 2));
+  return Object.entries(labels)
+    .map(([key, label]) => {
+      const hay = normaliseForSearch(`${label} ${key.replace(/_/g, ' ')}`);
+      return { key, label, hits: meaningful.filter((t) => hay.includes(t)).length };
+    })
+    .filter((m) => m.hits >= need)
+    .sort((a, b) => b.hits - a.hits || a.label.localeCompare(b.label))
+    .slice(0, limit)
+    .map(({ key, label }) => ({ key, label }));
+}

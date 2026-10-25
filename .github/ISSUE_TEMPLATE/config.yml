@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: A figure on inetgeek.com is wrong or has moved
+    url: https://inetgeek.com/contact/
+    about: The data is edited on the site, not in this repository. Send the vendor page URL and the figure; corrections replace the record and appear at /ledger/.

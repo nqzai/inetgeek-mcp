@@ -1,0 +1,20 @@
+name: Add a provider, category or comparison
+description: Something the server cannot answer because it is not covered yet
+labels: [coverage]
+body:
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What is missing
+      options: [A provider, A category, A comparison pair, A criterion]
+    validations: { required: true }
+  - type: input
+    id: what
+    attributes:
+      label: Name and homepage
+    validations: { required: true }
+  - type: textarea
+    id: why
+    attributes:
+      label: The decision you were trying to make
+      description: A concrete question the server could not answer is the most useful thing here.

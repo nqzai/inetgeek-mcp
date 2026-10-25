@@ -1,0 +1,27 @@
+name: Server bug
+description: A tool errors, returns the wrong shape, or behaves differently from its description
+labels: [bug]
+body:
+  - type: input
+    id: tool
+    attributes:
+      label: Tool
+      description: The tool name, e.g. plan_infrastructure
+    validations: { required: true }
+  - type: input
+    id: client
+    attributes:
+      label: Client and version
+      description: e.g. Claude Code 2.x, ChatGPT custom connector, Cursor
+    validations: { required: true }
+  - type: textarea
+    id: call
+    attributes:
+      label: Arguments you passed
+      description: Leave out anything private. The server does not log arguments, so we cannot look them up.
+    validations: { required: true }
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what you got
+    validations: { required: true }

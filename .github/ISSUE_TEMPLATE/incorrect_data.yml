@@ -1,0 +1,25 @@
+name: A fact the server returned looks wrong
+description: A value, date, source or quote that does not match the vendor's page
+labels: [data]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The data is read from vendors' own pages and edited on inetgeek.com, not in this repository. This form is the quickest way to get it checked; the contact page works too. A confirmed correction replaces the record and is published at https://inetgeek.com/ledger/.
+  - type: input
+    id: provider
+    attributes:
+      label: Provider and criterion
+      description: e.g. Neon, free tier
+    validations: { required: true }
+  - type: input
+    id: vendor_url
+    attributes:
+      label: The vendor page that says otherwise
+    validations: { required: true }
+  - type: textarea
+    id: said
+    attributes:
+      label: What the server returned, and what the page says
+      description: Paste the returned value and the sentence from the page.
+    validations: { required: true }

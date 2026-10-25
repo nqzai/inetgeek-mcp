@@ -1,0 +1,18 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.nqzai/inetgeek-mcp",
+  "title": "inetGeek",
+  "description": "Sourced infrastructure facts, comparisons, cost estimates and live DNS checks for AI assistants",
+  "websiteUrl": "https://inetgeek.com/mcp/",
+  "repository": {
+    "url": "https://github.com/nqzai/inetgeek-mcp",
+    "source": "github"
+  },
+  "version": "1.9.0",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://inetgeek-mcp.palashbagchi.workers.dev/mcp"
+    }
+  ]
+}

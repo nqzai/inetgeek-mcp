@@ -1,13 +1,14 @@
 /**
- * inetGeek MCP server (§Docs/TREG-MCP-INTEGRATION-PLAN-2026-09-11.md §2).
+ * inetGeek MCP server.
  *
  * Deliberately thin: every tool here reads data inetGeek already publishes at
  * https://inetgeek.com — the static `.md` mirror of every page, the site's
- * own search index, and the already-live, already-rate-limited DNS/SPF/
- * propagation APIs. No fact is computed or sourced here; this is a
- * distribution surface for content that's already verified and dated, not a
- * new place for a claim to originate. See [[inetgeek-locked-decisions]] for
- * why that boundary matters on this site.
+ * own search index, its JSON feeds, and the already-live, already-rate-limited
+ * DNS/SPF/propagation APIs. No fact is sourced here; this is a distribution
+ * surface for content that is already verified and dated, not a new place for
+ * a claim to originate. The one computation is estimate_monthly_cost, which is
+ * arithmetic over published per-volume rates, labelled as ours in every answer
+ * and never presented as a vendor quote.
  *
  * Stateless on purpose: one McpServer + one transport per request, no
  * Durable Object, no session store. Nothing here needs to remember a caller
@@ -17,7 +18,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { z } from 'zod';
-import { rankSearchDocs } from './search-rank';
+import { expandQuery, matchCriteria, normaliseForSearch, rankSearchDocs } from './search-rank';
 
 const SITE = 'https://inetgeek.com';
 
@@ -122,6 +123,9 @@ interface PlanLayerResult {
   bestFor: string | null;
   priceLabel: string;
   priceUsd: number | null;
+  /** 'price' when genuinely cheaper than the layer, 'tie' when only the alphabet separated it from coEqual. */
+  pickBasis: 'price' | 'tie' | 'none';
+  coEqual: string[];
 }
 interface PlanSecurityCandidate {
   id: string;
@@ -136,6 +140,17 @@ interface PlanSecurityCandidate {
   // have printed "undefined" as a provider's reason.
   [requirement: string]: unknown;
 }
+/** One ranked provider in a layer, from /plan.json `candidates`. */
+interface PlanCandidate {
+  id: string;
+  name: string;
+  /** Registrable-domain label of the homepage ("cloudflare", "amazon"): what `platform` matches on. */
+  vendor: string;
+  priceUsd: number | null;
+  priceLabel: string;
+  href: string;
+  primary: boolean;
+}
 interface PlanFile {
   layers: { key: string; label: string }[];
   securityRequirementKeys: string[];
@@ -143,6 +158,8 @@ interface PlanFile {
   stages: { key: string; label: string; layerKeys: string[]; requirements?: string[] }[];
   keywordLayers: Record<string, string[]>;
   securityCandidates: Record<string, PlanSecurityCandidate[]>;
+  /** Every ranked provider per layer; absent on a feed older than 2026-10-25. */
+  candidates?: Record<string, PlanCandidate[]>;
 }
 const loadPlan = () => loadJson<PlanFile>('/plan.json');
 
@@ -181,6 +198,8 @@ interface ProviderScore {
   weights: Partial<Record<string, number>>;
   distinct: boolean;
   caveat: string;
+  /** Why this record's number needs extra care — thin pillars, documented-but-unscored facts. Absent on an older feed. */
+  readingNotes?: string[];
 }
 interface ScoresFile {
   method: string;
@@ -189,6 +208,77 @@ interface ScoresFile {
   categories: Record<string, ProviderScore[]>;
 }
 const loadScores = () => loadJson<ScoresFile>('/scores.json');
+
+/** Shape of /usage-pricing.json — see src/pages/usage-pricing.json.ts in the site repo. */
+interface UsagePlanRow {
+  provider: string;
+  name: string;
+  category: string;
+  path: string;
+  plan: string;
+  unit: 'pageviews' | 'events' | 'emails' | 'mau';
+  currency?: string;
+  /** Absent on a quote-only row. */
+  monthly_usd?: number;
+  /** A purchase price, beside or instead of a monthly fee. */
+  one_time_usd?: number | null;
+  /** Units a month covered; null when `uncapped` says why there is no number. */
+  included?: number | null;
+  uncapped?: 'unlimited' | 'fair-use' | null;
+  /** A quote-only row: above this volume the vendor sells by quote and prints no price. */
+  quote_above?: number;
+  overage_usd_per_unit?: number | null;
+  /** Overage billed in blocks; `granularity` is what the page says about whole blocks versus prorating. */
+  overage_block?: { size: number; usd: number; granularity: 'unstated' | 'whole' | 'prorated' } | null;
+  /** Marginal rates that change with volume; `from` is the first unit billed at each. */
+  overage_tiers?: { from: number; per_unit: number }[] | null;
+  /** The volume through which the overage rate holds; null when it holds without limit. */
+  max_units?: number | null;
+  sites: number | null;
+  /** The vendor says "unlimited websites" for this plan. */
+  sites_unlimited?: boolean;
+  term: string | null;
+  source_url: string;
+  verified_at: string;
+  note: string | null;
+}
+interface UsagePricingFile {
+  count: number;
+  plans: UsagePlanRow[];
+}
+const loadUsagePricing = () => loadJson<UsagePricingFile>('/usage-pricing.json');
+
+/**
+ * A plan's [lowest, highest] monthly cost at `needed` units, or null when the
+ * plan prices nothing at that volume. Mirrors costRangeAt in the site's
+ * src/lib/price-tables.ts; the two ends differ only for a block overage whose
+ * billing the page leaves open.
+ */
+function priceRange(row: UsagePlanRow, needed: number): [number, number] | null {
+  const monthly = row.monthly_usd ?? 0;
+  const included = row.included ?? Infinity;
+  if (needed <= included) return [monthly, monthly];
+  if (row.overage_block) {
+    const { size, usd, granularity } = row.overage_block;
+    const excess = needed - included;
+    const prorated = monthly + (excess / size) * usd;
+    const whole = monthly + Math.ceil(excess / size) * usd;
+    return granularity === 'prorated' ? [prorated, prorated] : granularity === 'whole' ? [whole, whole] : [prorated, whole];
+  }
+  if (row.overage_tiers && row.overage_tiers.length) {
+    let cost = monthly;
+    row.overage_tiers.forEach((tier, i) => {
+      const last = i + 1 < row.overage_tiers!.length ? row.overage_tiers![i + 1].from - 1 : Infinity;
+      const inTier = Math.min(needed, last) - tier.from + 1;
+      if (inTier > 0) cost += inTier * tier.per_unit;
+    });
+    return [cost, cost];
+  }
+  if (row.overage_usd_per_unit == null) return null;
+  if (row.max_units != null && needed > row.max_units) return null;
+  const c = monthly + (needed - included) * row.overage_usd_per_unit;
+  return [c, c];
+}
 
 /** One provider's score in one category, by id or by name, case-insensitively. */
 function findScore(scores: ScoresFile, category: string, idOrName: string): ProviderScore | undefined {
@@ -239,7 +329,7 @@ const CRITERION_KEYS_BY_GROUP =
   'Infrastructure: persistent_processes, persistent_storage, managed_databases, edge_network, scale_to_zero, autoscaling, regions. ' +
   'Data: engine, max_connections, idle_behaviour, branching, pitr_window, read_replicas, backup_retention, backtrack. ' +
   'Storage: storage_price, operations_price, min_storage_duration, s3_compatible. ' +
-  'Observability: events_included, retention_window, session_replay, self_hostable, ingest_price_per_gb, query_price. ' +
+  'Observability: events_included, retention_window, session_replay, self_hostable, ingest_price_per_gb, query_price, revenue_attribution, payment_integrations, ai_crawler_tracking. ' +
   'Inference: flagship_input_price, flagship_output_price, budget_input_price, context_window, max_output_tokens, prompt_caching, batch_discount, rate_limits. ' +
   'Email: emails_included, overage_price_per_1000, log_retention, dedicated_ip, inbound_email. ' +
   'Auth: mau_included, sso_connection_price, sso_saml, scim_provisioning, mfa, audit_logs. ' +
@@ -250,7 +340,8 @@ const CRITERION_KEYS_BY_GROUP =
   'CI/CD: max_job_duration, self_hosted_runners, parallelism_pricing. ' +
   'Secrets: secrets_included, secret_versioning, dynamic_secrets. ' +
   'CDN: pop_count, image_optimization. ' +
-  'Compliance: soc2, iso27001, hipaa_eligible, gdpr_data_residency, pci_dss, encryption_at_rest, customer_managed_keys, rbac, private_networking, dedicated_infrastructure.';
+  'Documentation: docs_as_code, openapi_support, api_playground, sdk_generation, llms_txt, docs_mcp_server, docs_ai_assistant, docs_versioning. ' +
+  'Compliance: cookieless, soc2, iso27001, hipaa_eligible, gdpr_data_residency, pci_dss, encryption_at_rest, customer_managed_keys, rbac, private_networking, dedicated_infrastructure.';
 
 /**
  * Every URL section a provider can publish under, in the order
@@ -273,7 +364,7 @@ const CRITERION_KEYS_BY_GROUP =
  * /providers.json and is unaffected by this constant.
  */
 const SECTIONS_HINT =
-  '"hosting", "gpu", "databases", "storage", "caching", "vector-db", "data-api", "federation", "auth", "email", "queues", "payments", "cdn", "observability", "ci-cd", "secrets-mgmt", "analytics", "llm-apis", "search", "dns-hosting", "kubernetes", "iac", "backup", "api-gateway", "load-balancing", "realtime", "waf", "data-warehouse", "etl", "media", "sms", "streaming", "feature-flags", "incident-management", "finops", "ztna", "model-hosting"';
+  '"hosting", "gpu", "databases", "storage", "caching", "vector-db", "data-api", "federation", "auth", "email", "queues", "payments", "cdn", "observability", "ci-cd", "secrets-mgmt", "analytics", "llm-apis", "search", "dns-hosting", "kubernetes", "iac", "backup", "api-gateway", "load-balancing", "realtime", "waf", "data-warehouse", "etl", "media", "sms", "streaming", "feature-flags", "incident-management", "finops", "docs-platforms", "ztna", "model-hosting"';
 
 /**
  * The planner's stage names and layer keys, in the order plan-layers.ts
@@ -294,7 +385,7 @@ const SECTIONS_HINT =
  */
 const STAGES_HINT = '"idea", "mvp", "growth", "scale", "enterprise"';
 const LAYERS_HINT =
-  'hosting, database, storage, auth, email, observability, queues, cdn, caching, vector-db, secrets, ci-cd, llm, gpu, data-api, federation, analytics, payments, search, dns-hosting, kubernetes, iac, backup, api-gateway, load-balancing, realtime, waf, data-warehouse, etl, media, sms, streaming, feature-flags, incident-management, finops, ztna, model-hosting';
+  'hosting, database, storage, auth, email, observability, queues, cdn, caching, vector-db, secrets, ci-cd, llm, gpu, data-api, federation, analytics, payments, search, dns-hosting, kubernetes, iac, backup, api-gateway, load-balancing, realtime, waf, data-warehouse, etl, media, sms, streaming, feature-flags, incident-management, finops, docs, ztna, model-hosting';
 
 const DNS_SLUGS = [
   'a-record', 'aaaa-record', 'cname-record', 'mx-record', 'txt-record', 'ns-record', 'soa-record', 'caa-record', 'ptr-record', 'srv-record',
@@ -348,7 +439,7 @@ function buildServer(ctx: CallContext): McpServer {
     // what a client puts in front of a person, and without it the connector
     // rendered as "inetgeek" rather than the brand.
     title: 'inetGeek',
-    version: '1.6.1',
+    version: '1.9.0',
     websiteUrl: 'https://inetgeek.com',
     description:
       "Sourced infrastructure comparisons: provider pricing, limits and compliance read from each vendor's own documentation and dated, plus iScore, live DNS/SPF checks and a stack planner.",
@@ -398,6 +489,19 @@ function buildServer(ctx: CallContext): McpServer {
       // declared type against the response would see a mismatch.
       { src: `${SELF}/favicon.ico`, mimeType: 'image/vnd.microsoft.icon', sizes: ['16x16', '32x32', '48x48'] },
     ],
+  }, {
+    // READ BY THE CALLING MODEL AT HANDSHAKE. This server cannot see a project;
+    // the AI tool connected to it can. Most weak answers came from a caller
+    // asking in the abstract ("best analytics") when the repository it sits in
+    // would have settled half the question.
+    instructions: [
+      'inetGeek is a reference of sourced, dated provider facts. It does not know your user\'s project; you do. Before planning, estimating or comparing, read the project and pass what you find:',
+      '- the platform and runtime it deploys on (wrangler.jsonc, vercel.json, netlify.toml, Dockerfile, package.json scripts and dependencies, framework config) -> `platform` and `framework`;',
+      '- providers it already runs (dependencies, env var names such as STRIPE_, DATABASE_URL hosts, DNS and deploy config) -> `already_using`, and anything ruled out -> `exclude`;',
+      '- real volumes (monthly pageviews or events, users, emails, requests — from its analytics, logs or dashboards if you can reach them; ask the user if not) -> `units` for estimate_monthly_cost;',
+      '- hard requirements (data residency, SOC 2, SSO, cookie-free, self-hosting, which payment providers it takes) -> `security` and filter_providers.',
+      'Then: plan_infrastructure reports ties as ties (the pick is only alphabetical) — never present a tie as a recommendation; choose among the equals with what you read in the project. estimate_monthly_cost is inetGeek\'s arithmetic on published rates, not a quote. An empty cell means undocumented on the vendor\'s page at the date shown, not a confirmed no. When two of a vendor\'s own pages disagree, get_ledger shows both quotes and no value is recorded.',
+    ].join('\n'),
   });
 
   server.registerTool(
@@ -534,9 +638,19 @@ function buildServer(ctx: CallContext): McpServer {
     },
     async ({ query }) => {
       const index = await loadSearchIndex();
-      const { matches, kept, tokens, absent, bestHits } = rankSearchDocs(index.docs, query);
+      // Everyday words for a capability, widened to the words the fact labels use.
+      const asTyped = rankSearchDocs(index.docs, query);
+      const added = expandQuery(query, asTyped.tokens);
+      const { matches, kept, tokens, absent, bestHits } = added.length ? rankSearchDocs(index.docs, `${query} ${added.join(' ')}`) : asTyped;
+      // A concept that is a documented CRITERION is best answered by
+      // filter_providers, not by a list of pages that mention the word.
+      const { fact_labels } = await loadProviders();
+      const criteria = matchCriteria(tokens, fact_labels);
+      const criteriaLine = criteria.length
+        ? `Documented criteria that match your terms — filter_providers with these keys lists who documents them and the value: ${criteria.map((c) => `${c.label} (${c.key})`).join('; ')}.`
+        : '';
 
-      if (matches.length === 0) return textResult(`No inetGeek page matches "${query}".`);
+      if (matches.length === 0) return textResult(`No inetGeek page matches "${query}".${criteriaLine ? ` ${criteriaLine}` : ''}`);
 
       // `doc.path` already carries its trailing slash on this endpoint (see
       // search-index.json.ts) — unlike search-index.ts's in-repo builder,
@@ -557,6 +671,8 @@ function buildServer(ctx: CallContext): McpServer {
       if (absent.length) {
         notes.push(`No page mentions ${absent.map((t) => `"${t}"`).join(', ')}; ranked on the remaining terms.`);
       }
+      if (added.length) notes.push(`Also searched for ${added.map((t) => `"${t}"`).join(', ')}, the words the criteria use for what you described.`);
+      if (criteriaLine) notes.push(criteriaLine);
       return textResult(notes.length ? `${notes.join(' ')}\n\n${lines.join('\n')}` : lines.join('\n'));
     },
   );
@@ -611,6 +727,7 @@ function buildServer(ctx: CallContext): McpServer {
       const lines = [
         `${r.name} — iScore ${fmtScore(r)} in ${cat}, computed ${scores.generated_at}.`,
         r.caveat,
+        ...(r.readingNotes?.length ? ['', 'Read this score with care:', ...r.readingNotes.map((n) => `- ${n}`)] : []),
         `Method: ${scores.method}`,
         '',
         `Coverage: scored on ${Math.round(r.coverage * 100)}% of the decidable criteria peers document.`,
@@ -787,7 +904,7 @@ function buildServer(ctx: CallContext): McpServer {
       title: 'Plan an infrastructure stack',
       annotations: READ_ONLY,
       description:
-        "inetGeek's /plan/ planner: one suggested starting provider per layer — the cheapest with a documented free tier or a clean USD starting price, ranked by the provider's own facts, never a quality score — with its editorial reason and a floor total. THE TOTAL IS A FLOOR, NOT A PROJECTION: it sums documented entry points ($0 for a real free tier), and a layer whose pricing is usage-based with no flat minimum is listed as excluded, never counted as free; traffic, storage and usage move every number upward. Pick a stage or name layers explicitly; each stage is a superset of the one before it, and `scale` is most layers rather than all of them. Security requirements re-pick every layer whose providers document those criteria, and say so when no candidate satisfies every requirement rather than picking one anyway.",
+        "inetGeek's /plan/ planner: one suggested starting provider per layer — the cheapest with a documented free tier or a clean USD starting price, ranked by the provider's own facts, never a quality score — with its editorial reason and a floor total. THE TOTAL IS A FLOOR, NOT A PROJECTION: it sums documented entry points ($0 for a real free tier), and a layer whose pricing is usage-based with no flat minimum is listed as excluded, never counted as free; traffic, storage and usage move every number upward (use estimate_monthly_cost for a volume). Pick a stage or name layers explicitly; each stage is a superset of the one before it, and `scale` is most layers rather than all of them. Security requirements re-pick every layer whose providers document those criteria, and say so when no candidate satisfies every requirement rather than picking one anyway. PASS THE PROJECT'S CONTEXT: read its config and dependencies first (wrangler.jsonc, vercel.json, package.json, env var names, Dockerfile) and give `already_using` (providers it runs today), `platform` (the vendor it deploys on) and `exclude`. Without them most layers are TIES — every provider documents a free tier and the pick is only the alphabetically first — and the tool says so layer by layer rather than presenting it as a recommendation. With them, a layer you already cover is left alone, and a tie is broken toward providers on your own platform.",
       inputSchema: {
         stage: z
           .string()
@@ -809,11 +926,24 @@ function buildServer(ctx: CallContext): McpServer {
           .describe(
             'Optional application or runtime — "nextjs", "astro", "django", "laravel", "wordpress", "nodejs", "nuxt", "sveltekit", "ghost", "n8n". Appends the hosts that document real support for it, so one call answers "what does a Next.js project at MVP stage need, and who runs it".',
           ),
+        already_using: z
+          .array(z.string())
+          .optional()
+          .describe('Providers the project ALREADY uses, by id or name — "cloudflare-pages", "stripe", "Neon". A layer one of them covers is reported as covered and left out of the floor; the rest of the plan is built around them. Find the id with search_infrastructure or list_providers.'),
+        platform: z
+          .string()
+          .optional()
+          .describe('The platform the project runs on, as a vendor name: "cloudflare", "aws", "google", "microsoft", "vercel", "digitalocean". Where that vendor sells a provider in a layer it is preferred, because one platform is one bill, one login and one network. Matched on the registrable domain of each provider\'s homepage.'),
+        exclude: z
+          .array(z.string())
+          .optional()
+          .describe('Providers the project cannot or will not use (ids or names), e.g. for a licensing, residency or vendor-lock-in reason. Never picked.'),
       },
     },
-    async ({ stage, layers, security, framework }) => {
+    async ({ stage, layers, security, framework, already_using, platform, exclude }) => {
       const plan = await loadPlan();
       const validLayers = new Set(plan.results.map((r) => r.key));
+      const candidates = plan.candidates ?? {};
 
       let layerKeys: string[];
       let stageRequirements: string[] = [];
@@ -835,51 +965,131 @@ function buildServer(ctx: CallContext): McpServer {
       const badReqs = reqs.filter((r) => !plan.securityRequirementKeys.includes(r));
       if (badReqs.length > 0) return textResult(`Unknown security requirement(s): ${badReqs.join(', ')}. Valid: ${plan.securityRequirementKeys.join(', ')}.`);
 
+      // PROJECT CONTEXT. The caller's own AI tool can see the repository; this
+      // server cannot. Everything below turns what it passes into a decision the
+      // alphabet used to make: which layers are already covered, which provider
+      // wins a tie, which are off the table. Names that match nothing are
+      // reported back, never silently ignored — a typo in `already_using` would
+      // otherwise plan and price a layer the project already has.
+      const byKey = new Map<string, PlanCandidate>();
+      const layersOf = new Map<string, string[]>();
+      for (const [layerKey, list] of Object.entries(candidates)) {
+        for (const c of list) {
+          byKey.set(c.id, c);
+          byKey.set(c.name.toLowerCase(), c);
+          layersOf.set(c.id, [...(layersOf.get(c.id) ?? []), layerKey]);
+        }
+      }
+      const resolve = (raw: string) => byKey.get(raw.trim().toLowerCase()) ?? byKey.get(raw.trim().toLowerCase().replace(/\s+/g, '-'));
+      const used = new Map<string, PlanCandidate>();
+      const unrecognised: string[] = [];
+      for (const raw of already_using ?? []) {
+        const c = resolve(raw);
+        if (c) used.set(c.id, c);
+        else unrecognised.push(raw);
+      }
+      const excluded = new Set<string>();
+      for (const raw of exclude ?? []) {
+        const c = resolve(raw);
+        if (c) excluded.add(c.id);
+        else unrecognised.push(raw);
+      }
+      const PLATFORM_ALIASES: Record<string, string> = { aws: 'amazon', gcp: 'google', 'google cloud': 'google', azure: 'microsoft', gh: 'github' };
+      const platformRaw = platform?.trim().toLowerCase();
+      const platformKey = platformRaw ? PLATFORM_ALIASES[platformRaw] ?? platformRaw.replace(/\s+/g, '') : undefined;
+
       const lines: string[] = [];
+      const covered: string[] = [];
       let total = 0;
       let hasPriced = false;
-      const excluded: string[] = [];
+      const excludedFromTotal: string[] = [];
+      let ties = 0;
 
       for (const key of layerKeys) {
         const base = plan.results.find((r) => r.key === key)!;
-        let pick: { name: string | null; href: string; bestFor: string | null; priceLabel: string; priceUsd: number | null } = {
-          name: base.providerName,
-          href: base.providerHref ?? base.href,
-          bestFor: base.bestFor,
-          priceLabel: base.priceLabel,
-          priceUsd: base.priceUsd,
-        };
-        // Same rule as the page's client script: with any requirement set,
-        // auth and secrets re-pick the cheapest candidate satisfying ALL of
-        // them ('yes' only — 'limited' is not an answer to a hard requirement).
+        const ranked = (candidates[key] ?? []).filter((c) => !excluded.has(c.id));
+
+        // Already covered by something the project runs: leave the layer alone.
+        const have = ranked.filter((c) => used.has(c.id));
+        if (have.length > 0) {
+          covered.push(base.label);
+          lines.push(`${base.label}: already covered by ${have.map((c) => c.name).join(', ')} — kept, not added to the floor — ${SITE}${have[0].href}`);
+          continue;
+        }
+
+        let pick: { name: string | null; href: string; bestFor: string | null; priceLabel: string; priceUsd: number | null };
+        let basis: 'price' | 'tie' | 'platform' | 'security' | 'none' = base.pickBasis;
+        let tieNames: { name: string; href: string }[] = [];
+
         const pool = plan.securityCandidates[key];
         if (pool && reqs.length > 0) {
-          const filtered = pool.filter((c) => reqs.every((r) => c[r] === true));
-          pick =
-            filtered.length === 0
-              ? { name: null, href: base.href, bestFor: null, priceLabel: 'No provider documents this combination — see category page', priceUsd: null }
-              // bestFor falls back to the layer's own pick: a security-filtered
-              // candidate carries no editorial line of its own any more.
-              : { name: filtered[0].name, href: filtered[0].href, bestFor: null, priceLabel: filtered[0].priceLabel, priceUsd: filtered[0].priceUsd };
+          // Same rule as the page's client script: with any requirement set,
+          // the layer re-picks the cheapest candidate satisfying ALL of them
+          // ('yes' only — 'limited' is not an answer to a hard requirement).
+          const filtered = pool.filter((c) => reqs.every((r) => c[r] === true) && !excluded.has(String(c.id)));
+          const preferred = platformKey ? filtered.find((c) => byKey.get(String(c.id))?.vendor === platformKey) : undefined;
+          const chosen = preferred ?? filtered[0];
+          pick = chosen
+            ? { name: chosen.name, href: chosen.href, bestFor: null, priceLabel: chosen.priceLabel, priceUsd: chosen.priceUsd }
+            : { name: null, href: base.href, bestFor: null, priceLabel: 'No provider documents this combination — see category page', priceUsd: null };
+          basis = chosen ? (preferred ? 'platform' : 'security') : 'none';
+        } else if (ranked.length === 0) {
+          pick = { name: null, href: base.href, bestFor: null, priceLabel: 'No provider left in this layer after exclusions', priceUsd: null };
+          basis = 'none';
+        } else {
+          const onPlatform = platformKey ? ranked.find((c) => c.vendor === platformKey && c.primary === ranked[0].primary) ?? ranked.find((c) => c.vendor === platformKey) : undefined;
+          const top = onPlatform ?? ranked[0];
+          const stillBase = top.id === base.providerId;
+          pick = { name: top.name, href: top.href, bestFor: stillBase ? base.bestFor : null, priceLabel: top.priceLabel, priceUsd: top.priceUsd };
+          if (onPlatform) {
+            basis = 'platform';
+          } else {
+            // Recomputed here because an exclusion can change who the tie is between.
+            const equals = ranked.slice(1).filter((c) => c.primary === top.primary && c.priceUsd === top.priceUsd);
+            basis = equals.length > 0 ? 'tie' : 'price';
+            tieNames = equals.map((c) => ({ name: c.name, href: c.href }));
+          }
         }
 
         if (pick.priceUsd !== null) {
           total += pick.priceUsd;
           hasPriced = true;
         } else {
-          excluded.push(base.label);
+          excludedFromTotal.push(base.label);
         }
 
-        lines.push(
-          pick.name
-            ? `${base.label}: ${pick.name} — ${pick.priceLabel} — ${SITE}${pick.href}${pick.bestFor ? `\n  why: ${pick.bestFor}` : ''}\n  every ${base.label.toLowerCase()} provider: ${SITE}${base.href}`
-            : `${base.label}: ${pick.priceLabel} — ${SITE}${base.href}`,
-        );
+        const head = pick.name
+          ? `${base.label}: ${pick.name} — ${pick.priceLabel} — ${SITE}${pick.href}${pick.bestFor ? `\n  why: ${pick.bestFor}` : ''}`
+          : `${base.label}: ${pick.priceLabel} — ${SITE}${base.href}`;
+        const extra: string[] = [];
+        if (basis === 'platform') extra.push(`  basis: on your platform (${platform}) — chosen over the cheapest provider in this layer`);
+        if (basis === 'tie') {
+          ties += 1;
+          extra.push(
+            `  TIE, NOT A RECOMMENDATION: ${tieNames.length + 1} providers document the same starting price here, and ${pick.name} is only the first alphabetically. Others: ${tieNames.slice(0, 10).map((t) => t.name).join(', ')}${tieNames.length > 10 ? `, and ${tieNames.length - 10} more` : ''}. Choose on what the project needs (compare_providers, filter_providers), or pass already_using / platform / exclude.`,
+          );
+        }
+        if (pick.name) extra.push(`  every ${base.label.toLowerCase()} provider: ${SITE}${base.href}`);
+        lines.push([head, ...extra].join('\n'));
       }
 
       const totalLine = hasPriced ? `Starting floor for these layers: $${total}/mo` : 'No priceable layers picked';
       const excludedLine =
-        excluded.length > 0 ? `\nNot counted above (no clean starting price documented, usage-based): ${excluded.join(', ')}.` : '';
+        excludedFromTotal.length > 0 ? `\nNot counted above (no clean starting price documented, usage-based): ${excludedFromTotal.join(', ')}.` : '';
+      const coveredLine = covered.length > 0 ? `\nAlready covered by what you use (not counted): ${covered.join(', ')}.` : '';
+      const tieLine =
+        ties > 0 ? `\n${ties} of ${layerKeys.length} layers above are ties decided alphabetically. Without project context this is a list of equals, not a plan.` : '';
+
+      // A provider the caller says it uses that covers no chosen layer: say where it belongs.
+      const strays = [...used.values()].filter((c) => !(layersOf.get(c.id) ?? []).some((l) => layerKeys.includes(l)));
+      const strayLine =
+        strays.length > 0
+          ? `\nYou said you use ${strays.map((c) => `${c.name} (a ${(layersOf.get(c.id) ?? []).join('/')} provider)`).join(', ')}; none of the planned layers is theirs, so they changed nothing above. Add the layer to plan around it.`
+          : '';
+      const unrecognisedLine =
+        unrecognised.length > 0
+          ? `\nNot recognised, so ignored: ${unrecognised.join(', ')}. Use a provider id or name as list_providers shows it.`
+          : '';
 
       // A layer that does nothing on its own, picked without the layer it needs.
       // Reported rather than silently added: the caller asked for a specific
@@ -914,7 +1124,137 @@ function buildServer(ctx: CallContext): McpServer {
       }
 
       return textResult(
-        `${lines.join('\n\n')}\n\n${totalLine}${excludedLine}${dependencyLine}\n\nThis is not what you will pay — it is the sum of each layer's cheapest documented starting point. See ${SITE}/plan/ to change any pick.${frameworkBlock}`,
+        `${lines.join('\n\n')}\n\n${totalLine}${excludedLine}${coveredLine}${tieLine}${strayLine}${unrecognisedLine}${dependencyLine}\n\nThis is not what you will pay — it is the sum of each layer's cheapest documented starting point. See ${SITE}/plan/ to change any pick.${frameworkBlock}`,
+      );
+    },
+  );
+
+  server.registerTool(
+    'estimate_monthly_cost',
+    {
+      title: 'Estimate monthly cost at a stated volume',
+      annotations: READ_ONLY,
+      description:
+        "What each provider that publishes a per-volume price would charge a month at the volume you state — plan fee plus any overage, cheapest first, each with the plan, the formula, the vendor page it came from and the date it was read. This is INETGEEK'S ARITHMETIC ON PUBLISHED RATES, not a quote and not a projection: taxes, currency, annual discounts and a vendor's own definition of its unit are outside it, and it says so beside every figure. Covers web analytics (pageviews or events), email (emails sent a month) and auth (monthly active users) — see the `unit` argument; a provider absent from the list has no readable per-volume price on file, which says nothing about its price — use get_provider. Get the volume from the project (its analytics, logs or dashboards) rather than guessing, and say which unit it is: a vendor that counts events is not counting pageviews (Umami counts each saved event property as another event; Traks's own page counts a pageview as about two events — pass `events_per_pageview` for those plans).",
+      inputSchema: {
+        category: z.string().optional().describe('URL section or category id to price, e.g. "analytics". Omit for every category with per-volume prices on file.'),
+        units: z.number().positive().describe('The monthly volume, in the unit named by `unit`.'),
+        unit: z.enum(['pageviews', 'events', 'emails', 'mau']).default('pageviews').describe('What `units` counts: pageviews or events (web analytics), emails sent a month (email), or monthly active users (auth). Only pageviews and events are ever converted into each other, with `events_per_pageview`, and the output says so.'),
+        events_per_pageview: z.number().positive().default(1).describe('Events recorded per pageview, used only to compare a pageviews figure against plans that bill in events (or the reverse). 1 means a bare pageview and no custom events.'),
+        sites: z.number().int().positive().optional().describe('How many websites the plan must cover. Plans with a stated lower cap are skipped; plans that state no site cap are kept and flagged.'),
+      },
+    },
+    async ({ category, units, unit, events_per_pageview, sites }) => {
+      const [{ plans }, { providers }] = await Promise.all([loadUsagePricing(), loadProviders()]);
+      const wanted = category?.trim().toLowerCase();
+      const comparable = (u: UsagePlanRow['unit']) => u === unit || (['pageviews', 'events'].includes(u) && ['pageviews', 'events'].includes(unit));
+      // No currency conversion, here or anywhere on the site: a plan priced in
+      // another currency is named and left out of the comparison.
+      const foreign = [...new Set(plans.filter((p) => p.currency && p.currency !== 'USD').map((p) => `${p.name} (${p.currency})`))];
+      const inScope = plans.filter((p) => (!p.currency || p.currency === 'USD') && (!wanted || p.category === wanted || p.path.split('/')[1] === wanted) && comparable(p.unit));
+      if (inScope.length === 0) {
+        const have = [...new Set(plans.map((p) => `${p.path.split('/')[1]} (${p.unit === 'events' ? 'pageviews/events' : p.unit})`))].sort();
+        return textResult(`No per-volume prices on file for ${unit}${category ? ` in "${category}"` : ''}. Covered: ${have.join(', ') || 'none yet'}. For any other provider, get_provider has its entry price and pricing model as published.`);
+      }
+
+      const convert = (row: UsagePlanRow): { needed: number; note: string | null } =>
+        row.unit === unit
+          ? { needed: units, note: null }
+          : unit === 'pageviews'
+            ? { needed: units * events_per_pageview, note: `converted at ${events_per_pageview} event(s) per pageview` }
+            : { needed: units / events_per_pageview, note: `converted at ${events_per_pageview} event(s) per pageview` };
+
+      const byProvider = new Map<string, UsagePlanRow[]>();
+      for (const p of inScope) byProvider.set(p.provider, [...(byProvider.get(p.provider) ?? []), p]);
+
+      const n = (x: number) => x.toLocaleString('en-US');
+      const money = (x: number) => `$${x.toFixed(x < 100 ? 2 : 0)}`;
+      const priced: { cost: number; line: string }[] = [];
+      const cannot: string[] = [];
+      for (const [, allRows] of byProvider) {
+        const rows = allRows.filter((r) => r.quote_above === undefined);
+        const quotes = allRows.filter((r) => r.quote_above !== undefined);
+        let best: { range: [number, number]; row: UsagePlanRow; needed: number; note: string | null; siteNote: string | null } | undefined;
+        let volumeFits = false;
+        let highest = 0;
+        for (const row of rows) {
+          const { needed, note } = convert(row);
+          highest = Math.max(highest, row.overage_usd_per_unit == null && !row.overage_tiers && !row.overage_block ? row.included ?? Infinity : row.max_units ?? Infinity);
+          const range = priceRange(row, needed);
+          if (range === null) continue;
+          volumeFits = true;
+          if (sites !== undefined && !row.sites_unlimited && row.sites != null && row.sites < sites) continue;
+          if (!best || range[0] < best.range[0]) best = { range, row, needed, note, siteNote: sites !== undefined && row.sites == null && !row.sites_unlimited ? `the page states no site cap, so ${sites} site(s) is unchecked` : null };
+        }
+        const name = allRows[0].name;
+        if (!best) {
+          // Above the top printed band the vendor may say outright that it sells by quote.
+          const quoted = quotes.filter((q) => convert(q).needed >= (q.quote_above as number));
+          cannot.push(
+            volumeFits
+              ? `${name}: a plan on file covers this volume, but none that states a site cap covers ${sites} sites.`
+              : quoted.length
+                ? `${name}: no price is printed at this volume, and its pricing page sells it by quote ("contact" or "custom"): ${quoted.map((q) => `${q.plan} (quote-only above ${n(q.quote_above as number)})`).join('; ')}.`
+                : `${name}: ${n(units)} ${unit} is above the largest band on file (${n(highest)} ${rows[0].unit}); the vendor sells it, but no price for it is on file.`,
+          );
+          continue;
+        }
+        const { range, row, needed, note, siteNote } = best;
+        const monthly = row.monthly_usd ?? 0;
+        const included = row.included ?? Infinity;
+        const over = needed - included;
+        const volume = row.uncapped === 'unlimited' ? 'unlimited use' : row.uncapped === 'fair-use' ? 'fair use, no number stated' : `covers up to ${n(included)} ${row.unit}`;
+        const formula =
+          needed <= included
+            ? `${row.plan}: $${monthly}/mo, ${volume}`
+            : row.overage_block
+              ? `${row.plan}: $${monthly}/mo + $${row.overage_block.usd} per additional ${n(row.overage_block.size)} ${row.unit} for ${n(over)} extra${row.overage_block.granularity === 'unstated' ? ' (the page does not say whether a part block is prorated or billed whole, so this is a range)' : ''}`
+              : row.overage_tiers
+                ? `${row.plan}: $${monthly}/mo + ${n(over)} extra ${row.unit} at the printed marginal rates ($${row.overage_tiers.map((x) => x.per_unit).join(' → $')})`
+                : `${row.plan}: $${monthly}/mo + ${n(over)} extra ${row.unit} x $${row.overage_usd_per_unit}`;
+        // The table's own caption says how the vendor counts its unit, which is
+        // exactly what a converted figure depends on: shown whenever units were
+        // converted, so "events" is never silently read as "pageviews".
+        const unitNote = note && row.note ? `how the vendor counts: ${row.note.slice(0, 280)}${row.note.length > 280 ? '…' : ''}` : null;
+        // When the figure includes an overage, the table's caption carries the
+        // conditions on that rate (a ceiling, a first band, a rate that falls at
+        // volume), and those decide how far the number can be trusted.
+        const overageNote = needed > included && row.note ? `about the rate: ${row.note.slice(0, 300)}${row.note.length > 300 ? '…' : ''}` : null;
+        const flags = [note, unitNote, overageNote && !unitNote ? overageNote : null, siteNote, row.term].filter(Boolean).join('; ');
+        const cost = range[0] === range[1] ? money(range[0]) : `${money(range[0])}–${money(range[1])}`;
+        const once = row.one_time_usd ? ` + $${row.one_time_usd} one time` : '';
+        priced.push({
+          cost: range[0],
+          line: `${cost}/mo${once} — ${row.name} — ${formula}${flags ? ` (${flags})` : ''} — ${SITE}${row.path} — read ${row.verified_at}, ${row.source_url}`,
+        });
+      }
+      priced.sort((a, b) => a.cost - b.cost);
+
+      // Providers in the same section with nothing on file: named WITH what
+      // their own page says the entry price is, so an absent row reads as "no
+      // per-volume schedule" (a one-time licence, a free service, a price the
+      // page never paints) rather than "not an option".
+      const sections = new Set(inScope.map((p) => p.path.split('/')[1]));
+      const trim = (t: string) => (t.length > 170 ? `${t.slice(0, 167)}…` : t);
+      const missing = providers
+        .filter((p) => sections.has(sectionOf(p)) && !byProvider.has(p.id))
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .map((p) => {
+          const entry = p.facts.minimum_paid_price ?? p.facts.pricing_model;
+          const free = p.facts.free_tier?.value === true ? 'has a free tier' : null;
+          const said = entry ? `its page says: ${trim(shown(entry))} [read ${entry.verified_at}]` : free ?? 'no entry price documented';
+          return `${p.name} — ${said} (${SITE}${p.path})`;
+        });
+
+      return textResult(
+        [
+          `At ${units.toLocaleString('en-US')} ${unit} a month${sites ? `, ${sites} site(s)` : ''}. inetGeek's arithmetic on each vendor's published rates — not a quote; taxes, currency and the vendor's own definition of its unit are outside it.`,
+          '',
+          ...(priced.length ? priced.map((x) => x.line) : ['No provider on file can be priced at this volume.']),
+          ...(cannot.length ? ['', 'Not priced here:', ...cannot.map((c) => `- ${c}`)] : []),
+          ...(foreign.length ? ['', `Priced in another currency, which this tool does not convert: ${foreign.join(', ')}.`] : []),
+          ...(missing.length ? ['', 'No per-volume schedule on file, so not compared here (see get_provider for the full record):', ...missing.map((m) => `- ${m}`)] : []),
+        ].join('\n'),
       );
     },
   );
@@ -1031,7 +1371,7 @@ function buildServer(ctx: CallContext): McpServer {
       title: 'What inetGeek says it could not find, and what it changed',
       annotations: READ_ONLY,
       description:
-        "inetGeek's public ledger. Three records an agent cannot get anywhere else: every vendor page that was READ on a stated date and found silent on a criterion, every criterion classed as one a product structurally cannot have, and every change to a published figure with whether the vendor moved it or inetGeek corrected its own reading. A silence record is an observation about one page on one date — it is NOT a statement that the provider lacks the thing, and it must not be reported as one. It exists because comparisons lean on it: a documented criterion outranks a page that was read and does not mention it, and that lean is only fair if the evidence behind it is checkable. A provider whose page says more than was found can send the URL to https://inetgeek.com/contact/ and the row is replaced. Filter to one provider with `provider`, or omit it for the whole ledger.",
+        "inetGeek's public ledger. Four records an agent cannot get anywhere else: every vendor page that was READ on a stated date and found silent on a criterion, every criterion classed as one a product structurally cannot have, every case where two pages of the SAME vendor contradict each other on a criterion (both quotes and both URLs, with no value recorded — a vendor whose docs say crawlers are dropped while its homepage says they are counted is one), and every change to a published figure with whether the vendor moved it or inetGeek corrected its own reading. A silence record is an observation about one page on one date — it is NOT a statement that the provider lacks the thing, and it must not be reported as one. It exists because comparisons lean on it: a documented criterion outranks a page that was read and does not mention it, and that lean is only fair if the evidence behind it is checkable. A provider whose page says more than was found can send the URL to https://inetgeek.com/contact/ and the row is replaced. Filter to one provider with `provider`, or omit it for the whole ledger.",
       inputSchema: {
         provider: z
           .string()
@@ -1045,6 +1385,7 @@ function buildServer(ctx: CallContext): McpServer {
       if (!provider) return textResult(result.body);
       let parsed: {
         not_stated?: { id: string }[];
+        source_disagreements?: { id: string }[];
         not_offered?: { id: string }[];
         recent_changes?: { id: string }[];
         corrections?: string;
@@ -1062,9 +1403,10 @@ function buildServer(ctx: CallContext): McpServer {
         corrections: parsed.corrections,
         not_stated: pick(parsed.not_stated),
         not_offered: pick(parsed.not_offered),
+        source_disagreements: pick(parsed.source_disagreements),
         changes: pick(parsed.recent_changes),
       };
-      if (!scoped.not_stated.length && !scoped.not_offered.length && !scoped.changes.length) {
+      if (!scoped.not_stated.length && !scoped.not_offered.length && !scoped.changes.length && !scoped.source_disagreements.length) {
         return textResult(
           `Nothing in the ledger for "${provider}": no criterion recorded as unstated on its pages, none classed as not offered, and no published figure changed in the recent window. That is the ordinary case.`,
         );
